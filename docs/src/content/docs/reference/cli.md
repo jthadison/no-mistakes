@@ -384,6 +384,7 @@ no-mistakes axi sync --recover
 no-mistakes axi sync --recover --keep-local
 no-mistakes axi sync --bind-archive-ref refs/heads/archive/<name>
 no-mistakes axi sync --adopt-published
+no-mistakes axi sync --adopt-reconciled-local
 ```
 
 | Flag                 | Type     | Default | Description                                                                  |
@@ -404,8 +405,8 @@ Genuine divergence still reports `safety: blocked_diverged` and changes nothing 
 Under `--recover`, the possible worktree mutation is a strict fast-forward to the preserved pipeline head, or an adoption of a preserved head proven to carry every local change, both after relation-specific preservation checks. The bound-archive exception described below never changes the worktree at all.
 When the local gate branch is exactly at a newer same-branch pushed binding and Git proves that an older terminal run's unpublished preserved head is its ancestor, branch synchronization selects the newer binding; missing gate evidence, non-ancestor heads, or different or ambiguous target provenance remain blocked.
 Fork configurations verify the configured fork URL and exact feature ref rather than assuming `origin`.
-Dirty, in-progress, ahead, genuinely diverged, detached, wrong-branch, offline, changed-target, rewritten, deleted, legacy, or retired states fail closed without destructive recovery.
-Run `axi sync` only when structured output offers `next_action.code: sync`; process any blocked state instead of substituting reset, stash, merge, rebase, force, or branch replacement.
+Ordinary synchronization fails closed for dirty, in-progress, ahead, genuinely diverged, detached, wrong-branch, offline, changed-target, rewritten, deleted, legacy, or retired states without destructive recovery. The guarded adoption paths below handle their own narrower preconditions.
+Run the default `axi sync` only when structured output offers `next_action.code: sync`; for recovery or adoption, run the exact command offered by `next_action` instead of substituting reset, stash, merge, rebase, force, or branch replacement.
 
 ### Rewritten push target recovery
 
