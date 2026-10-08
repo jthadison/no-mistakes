@@ -1650,7 +1650,11 @@ func (s *Service) AdoptReconciledLocal(ctx context.Context) State {
 	}
 
 	branchRef := "refs/heads/" + state.Local.Branch
-	if err := git.FetchRemoteRef(ctx, s.GateDir, s.workDir(), branchRef, head); err != nil {
+	source, err := filepath.Abs(s.workDir())
+	if err != nil {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_assumptions_changed", "the invoking worktree path could not be resolved; no files or gate refs were changed")
+	}
+	if err := git.FetchRemoteRef(ctx, s.GateDir, source, branchRef, head); err != nil {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_import_failed", "the reconciled local commit could not be imported into the private gate; no gate branch was changed")
 	}
 
