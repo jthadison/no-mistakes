@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -128,6 +129,28 @@ func goTestPackagePatterns(command workflowCommand) []string {
 	return patterns
 }
 
+func goTestParallelism(t *testing.T, command workflowCommand) int {
+	t.Helper()
+	for index, arg := range command.args[1:] {
+		switch {
+		case strings.HasPrefix(arg, "-p="):
+			parallelism, err := strconv.Atoi(strings.TrimPrefix(arg, "-p="))
+			if err != nil || parallelism < 1 {
+				t.Fatalf("Windows go test has invalid package parallelism %q", arg)
+			}
+			return parallelism
+		case arg == "-p" && index+2 < len(command.args):
+			parallelism, err := strconv.Atoi(command.args[index+2])
+			if err != nil || parallelism < 1 {
+				t.Fatalf("Windows go test has invalid package parallelism %q", command.args[index+2])
+			}
+			return parallelism
+		}
+	}
+	t.Fatalf("Windows go test command %q must set package parallelism explicitly", command.name)
+	return 0
+}
+
 func workflowCommands(steps []wfStep) []workflowCommand {
 	return workflowCommandsMatching(steps, func(step wfStep) bool { return windowsOnly(step.If) })
 }
@@ -245,6 +268,13 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 		if goTimeout >= jobTimeout {
 			t.Fatalf("go test -timeout is %s and the job cap is %s; the Go timeout must fire first so a hang produces a goroutine dump instead of an evidence-free cancellation", goTimeout, jobTimeout)
 		}
+		packagePatterns := goTestPackagePatterns(command)
+		if len(packagePatterns) > 0 {
+			packages := goListPackages(t, packagePatterns...)
+			if parallelism := goTestParallelism(t, command); parallelism < len(packages) {
+				t.Fatalf("Windows go test package parallelism = %d, want at least %d for %v so a late package cannot wait behind an earlier hanging package", parallelism, len(packages), packagePatterns)
+			}
+		}
 		shard := matrixShardCondition(job.Steps[command.step].If)
 		if shard == "" {
 			t.Fatalf("Windows test step %q is not gated on matrix.shard", job.Steps[command.step].Name)
@@ -313,6 +343,9 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 	all := goListPackages(t, "./...")
 	gitHeavyFromFilter := filterPackages(all, exclude, true)
 	coreFromFilter := filterPackages(all, exclude, false)
+	if parallelism := goTestParallelism(t, coreCommand); parallelism < len(coreFromFilter) {
+		t.Fatalf("Windows core go test package parallelism = %d, want at least %d for the go-list remainder", parallelism, len(coreFromFilter))
+	}
 	gitHeavyFromArgs := append(append([]string{}, gitFromArgs...), stepsFromArgs...)
 	slices.Sort(gitHeavyFromArgs)
 	if !slices.Equal(gitHeavyFromArgs, gitHeavyFromFilter) {

@@ -108,14 +108,13 @@ func newCIRepairFixture(t *testing.T, revalidate bool, agentAction func(workDir 
 // unresolved check must remain an owner-action gate rather than being waived
 // or retried indefinitely.
 func TestCIStep_NoCodeChangeDiscardsFailureLogAndParksForOwner(t *testing.T) {
-	f := newCIRepairFixture(t, false, func(workDir string) {
-		if err := os.WriteFile(filepath.Join(workDir, ".ci-failed.log"), []byte("raw provider failure output\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	})
+	f := newCIRepairFixture(t, false, nil)
 	f.sctx.Agent = &mockAgent{
 		name: "test",
-		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+		runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			if err := os.WriteFile(filepath.Join(opts.CWD, ".ci-failed.log"), []byte("raw provider failure output\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
 			return &agent.Result{Output: []byte(`{"summary":"the timeout is external to the code","code_change_needed":false}`)}, nil
 		},
 	}
