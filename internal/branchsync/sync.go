@@ -1764,8 +1764,8 @@ func (s *Service) AdoptPublished(ctx context.Context) State {
 	}
 
 	branchRef := "refs/heads/" + state.Local.Branch
-	gateHead, err := git.Run(ctx, s.GateDir, "rev-parse", branchRef+"^{commit}")
-	if err != nil || gateHead != state.Pipeline.CurrentHead {
+	gateHead, gateExists, err := git.DirectRefTarget(ctx, s.GateDir, branchRef)
+	if err != nil || !gateExists || gateHead != state.Pipeline.CurrentHead {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_published_gate_changed", "the gate lane no longer matches the recovered pipeline head; no files or gate refs were changed")
 	}
 
@@ -2757,8 +2757,8 @@ func (s *Service) classifyCustodyReturned(ctx context.Context, state *State, run
 	}
 	branchRef := "refs/heads/" + state.Local.Branch
 	if strings.TrimSpace(s.GateDir) != "" {
-		gateHead, err := git.Run(ctx, s.GateDir, "rev-parse", branchRef+"^{commit}")
-		if err == nil && gateHead == state.Local.Head {
+		gateHead, gateExists, err := git.DirectRefTarget(ctx, s.GateDir, branchRef)
+		if err == nil && gateExists && gateHead == state.Local.Head {
 			state.Safety = "gate_ready"
 			state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
 			return
