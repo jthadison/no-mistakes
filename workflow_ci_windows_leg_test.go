@@ -233,11 +233,15 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 	}
 
 	jobTimeout := time.Duration(job.TimeoutMinutes) * time.Minute
+	const wantWindowsGoTimeout = 25 * time.Minute
 	var explicit []workflowCommand
 	var coreCommand workflowCommand
 	stepShards := map[string]struct{}{}
 	for _, command := range tests {
 		goTimeout := goTestTimeout(t, command)
+		if goTimeout != wantWindowsGoTimeout {
+			t.Fatalf("Windows go test -timeout is %s, want %s so the slowest shard gets a useful hang dump without approaching the job cap", goTimeout, wantWindowsGoTimeout)
+		}
 		if goTimeout >= jobTimeout {
 			t.Fatalf("go test -timeout is %s and the job cap is %s; the Go timeout must fire first so a hang produces a goroutine dump instead of an evidence-free cancellation", goTimeout, jobTimeout)
 		}
@@ -330,6 +334,7 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 			t.Errorf("core shard must not include git-heavy package %s", pkg)
 		}
 	}
+
 	requiredGitRest := []string{
 		"github.com/kunchenguid/no-mistakes/internal/git",
 		"github.com/kunchenguid/no-mistakes/internal/branchsync",
