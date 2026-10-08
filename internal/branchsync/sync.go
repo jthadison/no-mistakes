@@ -1666,7 +1666,7 @@ func (s *Service) AdoptReconciledLocal(ctx context.Context) State {
 		!freshClean || finalGateErr != nil || !finalGateExists || finalGate != gateHead {
 		return blockedPlan(freshState, StateCustodyReturned, "blocked_adopt_reconciled_local_assumptions_changed", "the selected run, branch, HEAD, worktree, or old gate lane changed before the reconciled-local gate update; no gate branch was changed")
 	}
-	if _, err := git.Run(ctx, s.GateDir, "update-ref", branchRef, head, gateHead); err != nil {
+	if _, err := git.Run(ctx, s.GateDir, "update-ref", "--no-deref", branchRef, head, gateHead); err != nil {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_gate_race", "the private gate branch changed while reconciled-local adoption was being applied; the lane was not replaced")
 	}
 
@@ -1827,7 +1827,7 @@ func (s *Service) AdoptPublished(ctx context.Context) State {
 	if err != nil || currentRepo == nil || TargetFingerprint(currentRepo.PushURL()) != pushTargetFingerprint {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_published_target_changed", "the configured push target changed while the published head was being verified; no files or gate refs were changed")
 	}
-	if _, err := git.Run(ctx, s.GateDir, "update-ref", branchRef, state.Local.Head, gateHead); err != nil {
+	if _, err := git.Run(ctx, s.GateDir, "update-ref", "--no-deref", branchRef, state.Local.Head, gateHead); err != nil {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_published_gate_race", "the gate lane changed while the published head was being adopted; the lane was not replaced and the recovered head remains preserved")
 	}
 
