@@ -1563,6 +1563,9 @@ func TestSyncRecoverFlagValidation(t *testing.T) {
 		{"axi", "sync", "--check", "--recover"},
 		{"axi", "sync", "--check", "--adopt-published"},
 		{"axi", "sync", "--recover", "--adopt-published"},
+		{"axi", "sync", "--check", "--adopt-reconciled-local"},
+		{"axi", "sync", "--recover", "--adopt-reconciled-local"},
+		{"axi", "sync", "--adopt-published", "--adopt-reconciled-local"},
 		{"axi", "sync", "--keep-local"},
 		{"axi", "sync", "--bind-archive-ref", "refs/heads/archive/test", "--check"},
 	} {

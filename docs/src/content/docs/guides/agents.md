@@ -172,6 +172,7 @@ no-mistakes axi sync --check
 no-mistakes axi sync
 no-mistakes axi sync --recover
 no-mistakes axi sync --adopt-published
+no-mistakes axi sync --adopt-reconciled-local
 no-mistakes axi respond --action approve
 no-mistakes axi logs --step review --full
 no-mistakes axi abort
@@ -182,6 +183,7 @@ Before any post-pipeline local commit or fresh run, read `branch_sync` and follo
 A `sync` action runs `no-mistakes axi sync` first.
 A `recover_custody` action is ordinary `no-mistakes axi sync --recover` to take a still-available preserved head, or `no-mistakes axi sync --recover --keep-local` when that head is unavailable and you are discarding the missing commits, or when a bound archive preserves divergent later work while custody returns at the reported required head; never substitute one action for the other. See [`no-mistakes rerun`](/no-mistakes/reference/cli/#no-mistakes-rerun) for the alternative validation path and its refusal conditions.
 A `recover_remote_rewritten` action is exact `no-mistakes axi sync --recover` after a terminal run whose push target was force-rewritten outside the pipeline: it anchors the superseded pipeline head and rebinds only the recorded push binding to the re-verified live head, and refuses `--keep-local`, a target or live head that changes during recovery, an unanchorable head, and a merged or closed PR. See [`no-mistakes axi sync`](/no-mistakes/reference/cli/#no-mistakes-axi-sync).
+An `adopt_reconciled_local` action is exact `no-mistakes axi sync --adopt-reconciled-local`: it is limited to a failed run after custody returned, proves tree equality, old-gate ancestry, and protected-commit reachability, anchors both heads create-only, imports the local commit into the private gate without a receive-hook push, and compare-and-swaps only that gate lane. It never contacts a configured remote or bypasses the full validation pipeline.
 An `adopt_published` action is `no-mistakes axi sync --adopt-published`: it verifies the configured push target already has the exact rebased local head, then updates only the stale gate lane. A target mismatch or target change refuses without replacing that lane.
 A `branch_sync.state` of `user_owned` means the run went terminal before changing the submitted head and cancellation released the branch: it is immediately usable and needs no sync action.
 When `next_action.code` is `continue_active_run`, run the reported command and keep driving the active run.

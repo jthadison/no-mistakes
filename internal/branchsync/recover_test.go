@@ -2987,3 +2987,189 @@ func TestAdoptPublishedRefusesReplacedPushTarget(t *testing.T) {
 		}
 	})
 }
+
+func newReconciledLocalFixture(t *testing.T) (*recoverFixture, string) {
+	t.Helper()
+	f := newRecoverFixture(t, types.RunFailed)
+	branchRef := "refs/heads/feature/recover"
+
+	// Reconciliation leaves the gate at the submitted head while the local
+	// branch is a new, clean commit with the exact preserved pipeline tree.
+	mustRun(t, f.local, "fetch", f.gate, "+refs/heads/feature/recover:refs/remotes/test/preserved")
+	mustRun(t, f.gate, "update-ref", branchRef, f.submitted, f.preserved)
+	mustRun(t, f.local, "reset", "--hard", f.preserved)
+	mustRun(t, f.local, "commit", "--allow-empty", "-m", "lossless reconciliation")
+	localHead := mustRun(t, f.local, "rev-parse", "HEAD")
+	if localHead == f.preserved {
+		t.Fatal("reconciled local head must differ from preserved pipeline head")
+	}
+	if err := f.db.SetRunCustodyReturned(f.run.ID); err != nil {
+		t.Fatal(err)
+	}
+	return f, localHead
+}
+
+func TestAdoptReconciledLocalPreservesPipelineHistoryAndOnlyMovesGateLane(t *testing.T) {
+	t.Parallel()
+	f, localHead := newReconciledLocalFixture(t)
+	branchRef := "refs/heads/feature/recover"
+
+	mustRun(t, f.gate, "update-ref", "refs/heads/unrelated", f.base)
+	unrelatedBefore := mustRun(t, f.gate, "rev-parse", "refs/heads/unrelated")
+	remoteBefore := mustRun(t, f.remote, "for-each-ref", "--format=%(refname) %(objectname)")
+	filesBefore := readOptional(t, filepath.Join(f.local, "file.txt")) + readOptional(t, filepath.Join(f.local, "fix.txt"))
+	inspected := f.service.InspectCached(f.ctx)
+	if inspected.NextAction == nil || inspected.NextAction.Code != "adopt_reconciled_local" {
+		t.Fatalf("lossless reconciled-local state did not offer adoption: %#v", inspected)
+	}
+
+	state := f.service.AdoptReconciledLocal(f.ctx)
+	if !state.Changed || state.Safety != "adopted_reconciled_local" {
+		t.Fatalf("reconciled-local adoption = %#v", state)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", branchRef); got != localHead {
+		t.Fatalf("gate lane = %s, want reconciled local head %s", got, localHead)
+	}
+	if state.NextAction == nil || state.NextAction.Code != "run_pipeline" ||
+		!strings.HasPrefix(state.NextAction.Command, "no-mistakes axi run --intent ") {
+		t.Fatalf("adoption did not expose a fresh pipeline action: %#v", state)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/unrelated"); got != unrelatedBefore {
+		t.Fatalf("unrelated gate ref changed to %s, want %s", got, unrelatedBefore)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.submitted {
+		t.Fatalf("old gate anchor = %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.local, "rev-parse", custody.RecoveryLocalRef(f.run.ID)); got != localHead {
+		t.Fatalf("local recovery anchor = %s, want %s", got, localHead)
+	}
+	if filesAfter := readOptional(t, filepath.Join(f.local, "file.txt")) + readOptional(t, filepath.Join(f.local, "fix.txt")); filesAfter != filesBefore {
+		t.Fatal("reconciled-local adoption changed worktree files")
+	}
+	if remoteAfter := mustRun(t, f.remote, "for-each-ref", "--format=%(refname) %(objectname)"); remoteAfter != remoteBefore {
+		t.Fatal("reconciled-local adoption contacted or changed the configured remote")
+	}
+
+	repeated := f.service.AdoptReconciledLocal(f.ctx)
+	if repeated.Changed || repeated.Safety != "already_adopted_reconciled_local" {
+		t.Fatalf("repeated reconciled-local adoption = %#v", repeated)
+	}
+}
+
+func TestAdoptReconciledLocalProofRefusalsDoNotMoveGate(t *testing.T) {
+	t.Run("tree mismatch", func(t *testing.T) {
+		f, _ := newReconciledLocalFixture(t)
+		if err := os.Remove(filepath.Join(f.local, "fix.txt")); err != nil {
+			t.Fatal(err)
+		}
+		mustRun(t, f.local, "add", "-A")
+		mustRun(t, f.local, "commit", "-m", "reconciled tree mismatch")
+		assertReconciledLocalRefused(t, f)
+	})
+
+	t.Run("old gate is not an ancestor", func(t *testing.T) {
+		f, _ := newReconciledLocalFixture(t)
+		tree := mustRun(t, f.local, "rev-parse", f.preserved+"^{tree}")
+		unrelated := mustRun(t, f.local, "commit-tree", tree, "-m", "unrelated reconciled head")
+		mustRun(t, f.local, "reset", "--hard", unrelated)
+		assertReconciledLocalRefused(t, f)
+	})
+
+	t.Run("protected pipeline commit is not reachable", func(t *testing.T) {
+		f, _ := newReconciledLocalFixture(t)
+		tree := mustRun(t, f.local, "rev-parse", f.preserved+"^{tree}")
+		recreated := mustRun(t, f.local, "commit-tree", tree, "-p", f.submitted, "-m", "recreated reconciled head")
+		mustRun(t, f.local, "reset", "--hard", recreated)
+		assertReconciledLocalRefused(t, f)
+	})
+
+	t.Run("missing recorded pipeline head", func(t *testing.T) {
+		f, _ := newReconciledLocalFixture(t)
+		if err := f.db.UpdateRunHeadSHA(f.run.ID, strings.Repeat("0", 40)); err != nil {
+			t.Fatal(err)
+		}
+		assertReconciledLocalRefused(t, f)
+	})
+
+	t.Run("dirty worktree", func(t *testing.T) {
+		f, _ := newReconciledLocalFixture(t)
+		if err := os.WriteFile(filepath.Join(f.local, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		assertReconciledLocalRefused(t, f)
+	})
+
+	t.Run("conflicting local anchor", func(t *testing.T) {
+		f, localHead := newReconciledLocalFixture(t)
+		mustRun(t, f.local, "update-ref", custody.RecoveryLocalRef(f.run.ID), f.submitted)
+		state := f.service.AdoptReconciledLocal(f.ctx)
+		if state.Changed || state.Safety != "blocked_adopt_reconciled_local_anchor_conflict" {
+			t.Fatalf("anchor conflict = %#v", state)
+		}
+		if got := mustRun(t, f.local, "rev-parse", custody.RecoveryLocalRef(f.run.ID)); got != f.submitted {
+			t.Fatalf("conflicting anchor changed to %s, want %s", got, f.submitted)
+		}
+		if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != localHead {
+			t.Fatalf("local HEAD changed to %s, want %s", got, localHead)
+		}
+		assertGateStillSubmitted(t, f)
+	})
+}
+
+func assertReconciledLocalRefused(t *testing.T, f *recoverFixture) {
+	t.Helper()
+	state := f.service.AdoptReconciledLocal(f.ctx)
+	if state.Changed || state.Safety == "adopted_reconciled_local" || state.Safety == "already_adopted_reconciled_local" {
+		t.Fatalf("reconciled-local refusal unexpectedly applied: %#v", state)
+	}
+	assertGateStillSubmitted(t, f)
+}
+
+func assertGateStillSubmitted(t *testing.T, f *recoverFixture) {
+	t.Helper()
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("gate lane changed to %s, want submitted head %s", got, f.submitted)
+	}
+}
+
+func TestAdoptReconciledLocalRefusesRacesBeforeMutation(t *testing.T) {
+	t.Run("gate race", func(t *testing.T) {
+		f, _ := newReconciledLocalFixture(t)
+		f.service.beforeAdoptReconciledLocal = func() {
+			mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.preserved, f.submitted)
+		}
+		state := f.service.AdoptReconciledLocal(f.ctx)
+		if state.Changed || state.Safety != "blocked_adopt_reconciled_local_gate_changed" {
+			t.Fatalf("gate race = %#v", state)
+		}
+		if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+			t.Fatalf("racing gate was overwritten: %s", got)
+		}
+	})
+
+	t.Run("local head race", func(t *testing.T) {
+		f, _ := newReconciledLocalFixture(t)
+		f.service.beforeAdoptReconciledLocal = func() {
+			mustRun(t, f.local, "reset", "--hard", f.submitted)
+		}
+		state := f.service.AdoptReconciledLocal(f.ctx)
+		if state.Changed || state.Safety != "blocked_adopt_reconciled_local_assumptions_changed" {
+			t.Fatalf("local head race = %#v", state)
+		}
+		assertGateStillSubmitted(t, f)
+	})
+
+	t.Run("run status race", func(t *testing.T) {
+		f, _ := newReconciledLocalFixture(t)
+		f.service.beforeAdoptReconciledLocal = func() {
+			if err := f.db.UpdateRunStatusWithVerifiedHead(f.run.ID, types.RunCancelled, f.preserved); err != nil {
+				t.Fatal(err)
+			}
+		}
+		state := f.service.AdoptReconciledLocal(f.ctx)
+		if state.Changed || state.Safety != "blocked_adopt_reconciled_local_assumptions_changed" {
+			t.Fatalf("run status race = %#v", state)
+		}
+		assertGateStillSubmitted(t, f)
+	})
+}

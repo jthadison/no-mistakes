@@ -178,6 +178,7 @@ type Service struct {
 	beforeRecoverBranchMove           func()
 	afterRecoverBranchMove            func()
 	beforeRecoverRebind               func()
+	beforeAdoptReconciledLocal        func()
 }
 
 // remoteTimeout returns the bounded deadline budget for one remote
@@ -1547,6 +1548,201 @@ func (s *Service) finishKeepLocalRecover(ctx context.Context, state State, runID
 	return fresh
 }
 
+// AdoptReconciledLocal imports an unpublished, losslessly reconciled local
+// head into the private gate and advances only the selected branch. It never
+// contacts the configured push target or invokes the gate receive hook.
+//
+// This is deliberately narrower than ordinary custody recovery. It is only
+// for a failed run after custody returned, where the gate still names the
+// submitted head, the local head contains that old gate history and every
+// protected pipeline commit, and the local and recorded pipeline trees are
+// identical. The anchors and final branch update are all create-only or
+// compare-and-swap operations.
+func (s *Service) AdoptReconciledLocal(ctx context.Context) State {
+	if refusal, blocked := s.gateContextRefusal(ctx); blocked {
+		return refusal
+	}
+	state, run, ok := s.inspect(ctx)
+	if !ok || run == nil || state.State != StateCustodyReturned || run.CustodyReturnedAt == nil || run.Status != types.RunFailed {
+		return blockedPlan(state, state.State, "blocked_adopt_reconciled_local_not_applicable", "reconciled-local adoption requires the selected failed run after custody returned; no files or gate refs were changed")
+	}
+	if strings.TrimSpace(s.GateDir) == "" {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_gate_unavailable", "the local gate is unavailable; no files or gate refs were changed")
+	}
+	if !state.Local.Clean {
+		return blockedPlan(state, StateDirty, "blocked_adopt_reconciled_local_dirty", "the invoking worktree is not completely clean; no files or gate refs were changed")
+	}
+	gateHead, _, proofErr := s.reconciledLocalProof(ctx, state, run)
+	if proofErr != "" {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_"+proofErr, "the local head does not satisfy the lossless reconciled-local proof; no files or gate refs were changed")
+	}
+	currentGate, currentGateExists, currentGateErr := git.DirectRefTarget(ctx, s.GateDir, "refs/heads/"+state.Local.Branch)
+	if currentGateErr != nil || !currentGateExists {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_gate_changed", "the private gate branch could not be verified; no files or gate refs were changed")
+	}
+	if currentGate == state.Local.Head {
+		state.Changed = false
+		state.Safety = "already_adopted_reconciled_local"
+		state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
+		return state
+	}
+	if run.HeadSHA == state.Local.Head {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_not_applicable", "the local head is already the recorded pipeline head; no files or gate refs were changed")
+	}
+	if currentGate != gateHead {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_gate_changed", "the private gate branch changed while the reconciled-local proof was being checked; no files or gate refs were changed")
+	}
+
+	if s.beforeAdoptReconciledLocal != nil {
+		s.beforeAdoptReconciledLocal()
+	}
+
+	// The proof above is a snapshot. Re-read every identity immediately before
+	// creating preservation anchors, then re-read again after the local import
+	// and immediately before the gate CAS.
+	freshRun, runErr := s.DB.GetRun(run.ID)
+	freshRepo, repoErr := s.DB.GetRepo(s.Repo.ID)
+	branch, branchErr := git.CurrentBranch(ctx, s.workDir())
+	head, headErr := git.HeadSHA(ctx, s.workDir())
+	clean, _ := worktreeClean(ctx, s.workDir())
+	if runErr != nil || repoErr != nil || freshRun == nil || freshRepo == nil ||
+		freshRun.ID != run.ID || freshRun.RepoID != s.Repo.ID || freshRun.Branch != state.Local.Branch ||
+		freshRun.Status != types.RunFailed || freshRun.CustodyReturnedAt == nil ||
+		freshRun.HeadSHA != run.HeadSHA || ptr(freshRun.SubmittedHeadSHA) != ptr(run.SubmittedHeadSHA) ||
+		freshRun.LastPushedSHA != nil || branchErr != nil || branch != state.Local.Branch ||
+		headErr != nil || head != state.Local.Head || !clean {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_assumptions_changed", "the selected run, repository, branch, HEAD, or worktree changed before reconciled-local adoption; no files or gate refs were changed")
+	}
+	if !samePath(freshRepo.WorkingPath, s.Repo.WorkingPath) {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_repository_changed", "the registered repository changed before reconciled-local adoption; no files or gate refs were changed")
+	}
+	gateHead, _, proofErr = s.reconciledLocalProof(ctx, state, freshRun)
+	if proofErr != "" {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_"+proofErr, "the local head no longer satisfies the lossless reconciled-local proof; no files or gate refs were changed")
+	}
+	currentGate, currentGateExists, currentGateErr = git.DirectRefTarget(ctx, s.GateDir, "refs/heads/"+state.Local.Branch)
+	if currentGateErr != nil || !currentGateExists {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_gate_changed", "the private gate branch could not be verified; no files or gate refs were changed")
+	}
+	if currentGate == head {
+		state.Changed = false
+		state.Safety = "already_adopted_reconciled_local"
+		state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
+		return state
+	}
+	if currentGate != gateHead {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_gate_changed", "the private gate branch changed while the reconciled-local proof was being checked; no files or gate refs were changed")
+	}
+
+	localAnchor := custody.RecoveryLocalRef(run.ID)
+	gateAnchor := custody.RecoveryGateRef(run.ID)
+	if compatible, err := exactCommitRefCompatible(ctx, s.workDir(), localAnchor, head); err != nil || !compatible {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_anchor_conflict", "the local recovery anchor conflicts with the reconciled local head; no files or gate refs were changed")
+	}
+	if compatible, err := exactCommitRefCompatible(ctx, s.GateDir, gateAnchor, gateHead); err != nil || !compatible {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_anchor_conflict", "the gate recovery anchor conflicts with the old gate head; no files or gate refs were changed")
+	}
+	if err := custody.PreserveRecoveryAnchor(ctx, s.workDir(), localAnchor, head); err != nil {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_anchor_failed", "the reconciled local head could not be anchored; no files or gate refs were changed")
+	}
+	if err := custody.PreserveRecoveryAnchor(ctx, s.GateDir, gateAnchor, gateHead); err != nil {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_anchor_failed", "the old gate head could not be anchored; no gate branch was changed")
+	}
+
+	branchRef := "refs/heads/" + state.Local.Branch
+	if err := git.FetchRemoteRef(ctx, s.GateDir, s.workDir(), branchRef, head); err != nil {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_import_failed", "the reconciled local commit could not be imported into the private gate; no gate branch was changed")
+	}
+
+	freshState, freshRun, freshOK := s.inspect(ctx)
+	freshBranch, freshBranchErr := git.CurrentBranch(ctx, s.workDir())
+	freshHead, freshHeadErr := git.HeadSHA(ctx, s.workDir())
+	freshClean, _ := worktreeClean(ctx, s.workDir())
+	finalGate, finalGateExists, finalGateErr := git.DirectRefTarget(ctx, s.GateDir, branchRef)
+	if !freshOK || freshRun == nil || freshRun.ID != run.ID || freshRun.RepoID != s.Repo.ID ||
+		freshRun.Status != types.RunFailed || freshRun.CustodyReturnedAt == nil ||
+		freshRun.HeadSHA != run.HeadSHA || freshRun.LastPushedSHA != nil ||
+		freshBranchErr != nil || freshBranch != state.Local.Branch || freshHeadErr != nil || freshHead != head ||
+		!freshClean || finalGateErr != nil || !finalGateExists || finalGate != gateHead {
+		return blockedPlan(freshState, StateCustodyReturned, "blocked_adopt_reconciled_local_assumptions_changed", "the selected run, branch, HEAD, worktree, or old gate lane changed before the reconciled-local gate update; no gate branch was changed")
+	}
+	if _, err := git.Run(ctx, s.GateDir, "update-ref", branchRef, head, gateHead); err != nil {
+		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_gate_race", "the private gate branch changed while reconciled-local adoption was being applied; the lane was not replaced")
+	}
+
+	final, finalRun, finalOK := s.inspect(ctx)
+	finalRepo, finalRepoErr := s.DB.GetRepo(s.Repo.ID)
+	finalBranch, finalBranchErr := git.CurrentBranch(ctx, s.workDir())
+	finalHead, finalHeadErr := git.HeadSHA(ctx, s.workDir())
+	finalClean, _ := worktreeClean(ctx, s.workDir())
+	finalGate, finalGateExists, finalGateErr = git.DirectRefTarget(ctx, s.GateDir, branchRef)
+	if !finalOK || finalRun == nil || finalRun.ID != run.ID || finalRun.RepoID != s.Repo.ID ||
+		finalRun.Branch != state.Local.Branch || finalRun.Status != types.RunFailed ||
+		finalRun.CustodyReturnedAt == nil || finalRun.HeadSHA != run.HeadSHA ||
+		ptr(finalRun.SubmittedHeadSHA) != ptr(run.SubmittedHeadSHA) || finalRun.LastPushedSHA != nil ||
+		finalRepoErr != nil || finalRepo == nil || !samePath(finalRepo.WorkingPath, s.Repo.WorkingPath) ||
+		finalBranchErr != nil || finalBranch != state.Local.Branch || finalHeadErr != nil || finalHead != head ||
+		!finalClean || finalGateErr != nil || !finalGateExists || finalGate != head {
+		final.Safety = "blocked_adopt_reconciled_local_postcondition"
+		final.Error = "the private gate did not remain at the exact reconciled local head after adoption; inspect the gate before retrying"
+		final.NextAction = nil
+		return final
+	}
+	final.Changed = true
+	final.Safety = "adopted_reconciled_local"
+	final.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
+	return final
+}
+
+// reconciledLocalProof returns the old gate head and all protected commits
+// that must remain reachable from the local reconciled head. It is read-only.
+func (s *Service) reconciledLocalProof(ctx context.Context, state State, run *db.Run) (string, []string, string) {
+	if run == nil || run.RepoID != s.Repo.ID || run.Branch != state.Local.Branch ||
+		run.Status != types.RunFailed || run.CustodyReturnedAt == nil ||
+		run.SubmittedHeadSHA == nil || strings.TrimSpace(*run.SubmittedHeadSHA) == "" ||
+		run.LastPushedSHA != nil || run.HeadSHA == "" ||
+		run.TerminalHeadVerifiedAt == nil {
+		return "", nil, "not_applicable"
+	}
+	branchRef := "refs/heads/" + state.Local.Branch
+	gateHead, exists, err := git.DirectRefTarget(ctx, s.GateDir, branchRef)
+	if err != nil || !exists {
+		return "", nil, "gate_changed"
+	}
+	oldGate := gateHead
+	if gateHead != *run.SubmittedHeadSHA {
+		if gateHead != state.Local.Head {
+			return "", nil, "gate_changed"
+		}
+		oldGate, exists, err = git.DirectRefTarget(ctx, s.GateDir, custody.RecoveryGateRef(run.ID))
+		if err != nil || !exists || oldGate != *run.SubmittedHeadSHA {
+			return "", nil, "gate_changed"
+		}
+	}
+	if !objectExists(ctx, s.workDir(), run.HeadSHA) || !objectExists(ctx, s.workDir(), oldGate) ||
+		!objectExists(ctx, s.workDir(), state.Local.Head) {
+		return "", nil, "missing_object"
+	}
+	preservedTree, preservedErr := git.Run(ctx, s.workDir(), "rev-parse", run.HeadSHA+"^{tree}")
+	localTree, localErr := git.Run(ctx, s.workDir(), "rev-parse", state.Local.Head+"^{tree}")
+	if preservedErr != nil || localErr != nil || preservedTree != localTree {
+		return "", nil, "tree_mismatch"
+	}
+	if !isAncestor(ctx, s.workDir(), oldGate, state.Local.Head) {
+		return "", nil, "old_gate_not_ancestor"
+	}
+	protected, err := revList(ctx, s.workDir(), "rev-list", oldGate+".."+run.HeadSHA)
+	if err != nil || len(protected) == 0 {
+		return "", nil, "protected_commits_unreadable"
+	}
+	for _, commit := range protected {
+		if !isAncestor(ctx, s.workDir(), commit, state.Local.Head) {
+			return "", nil, "protected_commit_missing"
+		}
+	}
+	return oldGate, protected, ""
+}
+
 // AdoptPublished moves one stale custody-returned gate lane to a rewritten
 // branch only after the configured push target proves that the exact local
 // head is already published there. It never pushes to that target or changes
@@ -1777,7 +1973,7 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 	if run.LastPushedSHA == nil || run.PushTargetFingerprint == nil || run.PushRef == nil || run.PushGeneration == nil || run.SubmittedHeadSHA == nil {
 		if run.SubmittedHeadSHA != nil && run.HeadSHA != ptr(run.SubmittedHeadSHA) {
 			if run.CustodyReturnedAt != nil {
-				s.classifyCustodyReturned(ctx, &state)
+				s.classifyCustodyReturned(ctx, &state, run)
 				return state, run, true
 			}
 			s.classifyPipelineOwned(ctx, &state, run, "the pipeline head has moved but has not been successfully pushed; do not make local follow-up commits yet")
@@ -1790,7 +1986,7 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 		// recover, and the branch and head are immediately usable.
 		if run.SubmittedHeadSHA != nil && run.LastPushedSHA == nil {
 			if run.CustodyReturnedAt != nil {
-				s.classifyCustodyReturned(ctx, &state)
+				s.classifyCustodyReturned(ctx, &state, run)
 				return state, run, true
 			}
 			if run.Status == types.RunPending || run.Status == types.RunRunning {
@@ -2545,29 +2741,41 @@ func RunHeadUnmoved(state State) bool {
 }
 
 // classifyCustodyReturned reports a branch whose stranded terminal run was
-// explicitly recovered and never had a push binding. A diverged local head is
-// not ready to start a fresh run until the gate lane has safely adopted the
-// already-published rewrite; all other relationships remain informative only.
-func (s *Service) classifyCustodyReturned(ctx context.Context, state *State) {
+// explicitly recovered and never had a push binding. A genuinely diverged
+// local head is not ready to start a fresh run until the gate lane has safely
+// adopted the already-published rewrite; a losslessly reconciled ahead head
+// receives its own guarded adoption action. All other relationships remain
+// informative only.
+func (s *Service) classifyCustodyReturned(ctx context.Context, state *State, run *db.Run) {
 	state.State = StateCustodyReturned
 	state.Error = ""
 	state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, state.Pipeline.CurrentHead)
-	if state.Relation == RelationDiverged {
-		branchRef := "refs/heads/" + state.Local.Branch
-		if strings.TrimSpace(s.GateDir) != "" {
-			gateHead, err := git.Run(ctx, s.GateDir, "rev-parse", branchRef+"^{commit}")
-			if err == nil && gateHead == state.Local.Head {
-				state.Safety = "gate_ready"
-				state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
-				return
-			}
-		}
-		state.Safety = "recovery_required"
-		state.NextAction = &NextAction{Code: "adopt_published", Command: "no-mistakes axi sync --adopt-published"}
+	if state.Relation != RelationDiverged && state.Relation != RelationAhead {
+		state.Safety = "custody_returned"
+		state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
 		return
 	}
-	state.Safety = "custody_returned"
-	state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
+	branchRef := "refs/heads/" + state.Local.Branch
+	if strings.TrimSpace(s.GateDir) != "" {
+		gateHead, err := git.Run(ctx, s.GateDir, "rev-parse", branchRef+"^{commit}")
+		if err == nil && gateHead == state.Local.Head {
+			state.Safety = "gate_ready"
+			state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
+			return
+		}
+		if _, _, proofErr := s.reconciledLocalProof(ctx, *state, run); proofErr == "" {
+			state.Safety = "reconciled_local_recoverable"
+			state.NextAction = &NextAction{Code: "adopt_reconciled_local", Command: "no-mistakes axi sync --adopt-reconciled-local"}
+			return
+		}
+	}
+	if state.Relation == RelationAhead {
+		state.Safety = "custody_returned"
+		state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
+		return
+	}
+	state.Safety = "recovery_required"
+	state.NextAction = &NextAction{Code: "adopt_published", Command: "no-mistakes axi sync --adopt-published"}
 }
 
 // relationBetween classifies the local head against a target commit using only
