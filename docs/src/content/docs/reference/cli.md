@@ -393,6 +393,7 @@ no-mistakes axi sync --adopt-published
 | `--keep-local`       | `bool`   | `false` | With `--recover`: keep the current local head; never touches the worktree   |
 | `--bind-archive-ref` | `string` | (none)  | Bind one existing `refs/heads/archive/*` commit as exact evidence for a keep-local recovery; never creates or moves a Git ref |
 | `--adopt-published`  | `bool`   | `false` | Adopt a clean diverged local head into its stale gate lane only when the configured push target has that exact head |
+| `--adopt-reconciled-local` | `bool` | `false` | Adopt a clean losslessly reconciled local head into the private gate after proving tree, ancestry, and protected-commit reachability |
 
 The default command is an explicit non-interactive apply request and never prompts.
 All modes return the complete `branch_sync` object as TOON.
@@ -417,6 +418,36 @@ That recovery re-reads the live target, anchors the superseded pipeline head und
 A custody-returned branch can later be rebased and force-with-lease pushed to its configured target. Its local head then diverges from the preserved gate lane, so an ordinary gate push correctly rejects it as non-fast-forward. Status reports `state: custody_returned`, `relation: diverged`, and `next_action.code: adopt_published` instead of directing another rejected `axi run`.
 
 `axi sync --adopt-published` is the explicit recovery. It requires a clean exact checked-out branch, the same recovered lane at its recorded preserved head, and a live configured push target whose branch exactly equals local `HEAD`. It fetches that verified object into the local gate, preserves the old gate head under the run's recovery ref, then compare-and-swaps only the current lane. It never pushes to the configured target or changes the worktree. A missing, changed, or different target head, a changed gate lane, or changed local assumptions refuses without replacing the lane.
+
+### Lossless reconciled-local gate adoption
+
+Lossless reconciliation can leave a clean local commit unpublished even though
+its tree is identical to the recorded pipeline head and every protected
+pipeline commit remains reachable. After custody has already returned from a
+failed run, status reports `next_action.code: adopt_reconciled_local` when the
+private gate branch is still exactly at the run's submitted head and that old
+head is an ancestor of the local head.
+
+Run the exact offered command:
+
+```sh
+no-mistakes axi sync --adopt-reconciled-local
+```
+
+The command rechecks the selected run, repository, branch, clean `HEAD`, tree
+equality, old-gate ancestry, and protected-commit reachability immediately
+before mutation. It creates only the local and old-gate recovery anchors,
+imports the local commit into the private gate without a receive-hook push, and
+compare-and-swaps only the target gate branch. It never contacts or updates a
+configured remote, changes worktree files, bypasses validation, or moves an
+unrelated gate ref. A dirty worktree, missing object, changed run or branch,
+tree or ancestry mismatch, protected commit that is no longer reachable, anchor
+conflict, or gate race refuses without replacing the lane.
+
+Success is idempotent. Only after the private gate points at the exact
+reconciled local head does the result expose the ordinary fresh
+`no-mistakes axi run --intent "..."` action; that run executes the full
+validation pipeline.
 
 ### Custody recovery
 
