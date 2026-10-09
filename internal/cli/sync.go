@@ -79,7 +79,7 @@ func newSyncCmd() *cobra.Command {
 }
 
 func newAxiSyncCmd() *cobra.Command {
-	var check, recover, keepLocal, adoptPublished bool
+	var check, recover, keepLocal, adoptPublished, adoptReconciledLocal bool
 	var bindArchiveRef string
 	cmd := &cobra.Command{
 		Use:   "sync",
@@ -98,21 +98,27 @@ func newAxiSyncCmd() *cobra.Command {
 			"--bind-archive-ref binds one exact existing refs/heads/archive/* commit to\n" +
 			"the selected terminal run; it never creates or moves a Git ref.\n" +
 			"--adopt-published performs the guarded gate-lane recovery offered by\n" +
-			"next_action.code: adopt_published.",
+			"next_action.code: adopt_published.\n" +
+			"--adopt-reconciled-local performs the narrow lossless-reconciliation handoff\n" +
+			"offered by next_action.code: adopt_reconciled_local. It imports only the\n" +
+			"clean local commit into the private gate, never contacts or pushes a remote,\n" +
+			"and then updates only the selected gate branch with a compare-and-swap.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if (check && recover) || (check && adoptPublished) || (recover && adoptPublished) {
-				return emitError(cmd, 2, "choose only one of --check, --recover, and --adopt-published")
+			if (check && recover) || (check && adoptPublished) || (check && adoptReconciledLocal) ||
+				(recover && adoptPublished) || (recover && adoptReconciledLocal) ||
+				(adoptPublished && adoptReconciledLocal) {
+				return emitError(cmd, 2, "choose only one of --check, --recover, --adopt-published, and --adopt-reconciled-local")
 			}
 			if keepLocal && !recover {
 				return emitError(cmd, 2, "--keep-local requires --recover")
 			}
-			if bindArchiveRef != "" && (check || recover || keepLocal || adoptPublished) {
+			if bindArchiveRef != "" && (check || recover || keepLocal || adoptPublished || adoptReconciledLocal) {
 				return emitError(cmd, 2, "--bind-archive-ref cannot be combined with synchronization or recovery flags")
 			}
-			return runAxiSync(cmd, check, recover, keepLocal, adoptPublished, bindArchiveRef)
+			return runAxiSync(cmd, check, recover, keepLocal, adoptPublished, adoptReconciledLocal, bindArchiveRef)
 		},
 	}
 	cmd.Flags().BoolVar(&check, "check", false, "freshly verify and return the plan without changing HEAD")
@@ -120,6 +126,7 @@ func newAxiSyncCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&keepLocal, "keep-local", false, "with --recover: keep the current local head; anchor available preserved commits, discard genuinely missing ones, and make the gate follow the kept head")
 	cmd.Flags().BoolVar(&adoptPublished, "adopt-published", false, "adopt a clean diverged local head into its stale gate lane only when the configured push target already has that exact head")
 	cmd.Flags().StringVar(&bindArchiveRef, "bind-archive-ref", "", "bind one existing refs/heads/archive/* commit as exact keep-local recovery evidence without changing Git refs")
+	cmd.Flags().BoolVar(&adoptReconciledLocal, "adopt-reconciled-local", false, "adopt a clean reconciled local head into the private gate after proving tree, ancestry, and protected-commit preservation")
 	return cmd
 }
 
@@ -410,6 +417,9 @@ func humanSyncSummary(state branchsync.State) string {
 		}
 		return "pipeline fix is not pushed yet; do not make local follow-up commits"
 	case branchsync.StateCustodyReturned:
+		if state.Safety == "reconciled_local_recoverable" && state.NextAction != nil {
+			return "a losslessly reconciled local head needs guarded private-gate adoption before it can start a fresh run"
+		}
 		if state.Safety == "recovery_required" && state.NextAction != nil {
 			return "a rebased local head needs guarded gate-lane adoption before it can start a fresh run"
 		}
@@ -447,7 +457,7 @@ func humanSyncSummary(state branchsync.State) string {
 	}
 }
 
-func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished bool, bindArchiveRef string) error {
+func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished, adoptReconciledLocal bool, bindArchiveRef string) error {
 	started := time.Now()
 	mode := "apply"
 	switch {
@@ -461,6 +471,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished bo
 		mode = "recover"
 	case adoptPublished:
 		mode = "adopt_published"
+	case adoptReconciledLocal:
+		mode = "adopt_reconciled_local"
 	}
 	var state branchsync.State
 	result := "error"
@@ -481,6 +493,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished bo
 		state = service.Recover(cmd.Context(), keepLocal)
 	case adoptPublished:
 		state = service.AdoptPublished(cmd.Context())
+	case adoptReconciledLocal:
+		state = service.AdoptReconciledLocal(cmd.Context())
 	default:
 		state = service.Apply(cmd.Context())
 	}
@@ -510,8 +524,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished bo
 	if bindArchiveRef != "" {
 		successful = verifiedArchiveRecovery(state)
 	}
-	if adoptPublished {
-		successful = state.Changed
+	if adoptPublished || adoptReconciledLocal {
+		successful = state.Changed || state.Safety == "already_adopted_reconciled_local"
 	}
 	if successful {
 		if state.Changed {
