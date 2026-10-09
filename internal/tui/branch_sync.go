@@ -63,7 +63,11 @@ func renderLocalBranchStatus(state *branchsync.State, refreshing bool, width int
 		case branchsync.StateTargetChanged:
 			message = "The configured push target changed after the pipeline push. Synchronization is blocked."
 		case branchsync.StateCustodyReturned:
-			message = "Custody returned; the branch is yours. Start a fresh run when ready."
+			if state.Safety == "reconciled_local_recoverable" && state.NextAction != nil {
+				message = "Lossless reconciled-local recovery is ready, but the private gate must be adopted first. Run `no-mistakes axi sync --adopt-reconciled-local`; fresh runs stay blocked until it succeeds."
+			} else {
+				message = "Custody returned; the branch is yours. Start a fresh run when ready."
+			}
 		case branchsync.StateUserOwned:
 			message = "Run ended before the pipeline changed anything; the branch and head are yours and immediately usable."
 		default:

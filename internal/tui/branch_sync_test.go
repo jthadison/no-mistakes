@@ -305,6 +305,42 @@ func TestArchiveRecoveryConfirmationUsesOnlyGuardedKeepLocalAction(t *testing.T)
 	}
 }
 
+func TestReconciledLocalStatusBlocksFreshRunUntilGateAdoption(t *testing.T) {
+	run := &ipc.RunInfo{ID: "run-reconciled", Branch: "feature", Status: types.RunFailed}
+	m := NewModel("socket", nil, run)
+	m.branchSync = &branchsync.State{
+		State:  branchsync.StateCustodyReturned,
+		Safety: "reconciled_local_recoverable",
+		Local:  branchsync.LocalState{Branch: "feature", Head: strings.Repeat("a", 40), Clean: true},
+		Pipeline: branchsync.PipelineState{
+			RunID: run.ID, Status: "failed", CurrentHead: strings.Repeat("c", 40),
+		},
+		NextAction: &branchsync.NextAction{
+			Code:    "adopt_reconciled_local",
+			Command: "no-mistakes axi sync --adopt-reconciled-local",
+		},
+	}
+
+	view := stripANSI(renderLocalBranchStatus(m.branchSync, false, 80))
+	for _, want := range []string{
+		"no-mistakes axi sync --adopt-reconciled-local",
+		"fresh runs stay blocked until it succeeds",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("reconciled-local status missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "Custody returned; the branch is yours. Start a fresh run when ready.") {
+		t.Fatalf("reconciled-local status offered an unguarded fresh run:\n%s", view)
+	}
+
+	next, cmd := m.handleKey(keyMsg("u"))
+	m = next.(Model)
+	if cmd != nil || m.syncConfirm || m.recoverConfirm {
+		t.Fatalf("reconciled-local state exposed an unsupported TUI mutation: %#v", m)
+	}
+}
+
 // TestActivePipelineOwnedStateOffersNoRecoveryAction pins that the recovery
 // affordance never appears while the owning run is still active.
 func TestActivePipelineOwnedStateOffersNoRecoveryAction(t *testing.T) {
