@@ -329,3 +329,18 @@ func TestActivePipelineOwnedStateOffersNoRecoveryAction(t *testing.T) {
 		t.Fatalf("u acted on an active pipeline_owned state: %#v", m)
 	}
 }
+func TestReconciledLocalStatusShowsGuardedAdoptionCommand(t *testing.T) {
+	state := branchsync.State{
+		State:  branchsync.StateCustodyReturned,
+		Safety: "reconciled_local_recoverable",
+		NextAction: &branchsync.NextAction{
+			Code:    "adopt_reconciled_local",
+			Command: "no-mistakes axi sync --adopt-reconciled-local",
+		},
+	}
+
+	view := stripANSI(renderLocalBranchStatus(&state, false, 80))
+	if !strings.Contains(view, "guarded private-gate adoption") || !strings.Contains(view, state.NextAction.Command) || strings.Contains(view, "Start a fresh run when ready") {
+		t.Fatalf("reconciled-local status gave unsafe guidance:\n%s", view)
+	}
+}

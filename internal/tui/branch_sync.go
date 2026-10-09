@@ -65,6 +65,11 @@ func renderLocalBranchStatus(state *branchsync.State, refreshing bool, width int
 		case branchsync.StateCustodyReturned:
 			if state.Safety == "blocked_recover_manual_reconciliation" {
 				message = "Custody returned, but the selected gate lane needs manual reconciliation."
+			} else if state.Safety == "reconciled_local_recoverable" {
+				message = "Custody returned, but the losslessly reconciled local head needs guarded private-gate adoption before starting a fresh run."
+				if state.NextAction != nil {
+					message = fmt.Sprintf("Custody returned, but the losslessly reconciled local head needs guarded private-gate adoption. Run `%s` before starting a fresh run.", state.NextAction.Command)
+				}
 			} else {
 				message = "Custody returned; the branch is yours. Start a fresh run when ready."
 			}
