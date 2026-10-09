@@ -2774,8 +2774,9 @@ func (s *Service) classifyCustodyReturned(ctx context.Context, state *State, run
 		}
 	}
 	if state.Relation == RelationAhead {
-		state.Safety = "custody_returned"
-		state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
+		state.Safety = "blocked_recover_manual_reconciliation"
+		state.Error = "the selected gate lane is not a verified direct ref for the reconciled local head; inspect and reconcile the gate manually"
+		state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
 		return
 	}
 	state.Safety = "recovery_required"
