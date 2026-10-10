@@ -417,6 +417,9 @@ func humanSyncSummary(state branchsync.State) string {
 		}
 		return "pipeline fix is not pushed yet; do not make local follow-up commits"
 	case branchsync.StateCustodyReturned:
+		if state.Safety == "blocked_recover_manual_reconciliation" {
+			return "custody returned, but the selected gate lane needs manual reconciliation before a fresh run"
+		}
 		if state.Safety == "reconciled_local_recoverable" && state.NextAction != nil {
 			return "a losslessly reconciled local head needs guarded private-gate adoption before it can start a fresh run"
 		}

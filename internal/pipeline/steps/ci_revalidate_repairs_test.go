@@ -102,6 +102,51 @@ func newCIRepairFixture(t *testing.T, revalidate bool, agentAction func(workDir 
 	return &ciRepairFixture{sctx: sctx, dir: dir, upstream: upstream, headSHA: headSHA, gateDir: sctx.GateDir, logs: logs}
 }
 
+// TestCIStep_NoCodeChangeDiscardsFailureLogAndParksForOwner covers the
+// no-code CI repair path when the fixer leaves generated failure evidence in
+// the worktree. The evidence must not become a repair commit, and the
+// unresolved check must remain an owner-action gate rather than being waived
+// or retried indefinitely.
+func TestCIStep_NoCodeChangeDiscardsFailureLogAndParksForOwner(t *testing.T) {
+	f := newCIRepairFixture(t, false, nil)
+	f.sctx.Agent = &mockAgent{
+		name: "test",
+		runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			if err := os.WriteFile(filepath.Join(opts.CWD, ".ci-failed.log"), []byte("raw provider failure output\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return &agent.Result{Output: []byte(`{"summary":"the timeout is external to the code","code_change_needed":false}`)}, nil
+		},
+	}
+
+	outcome, err := f.run(t)
+	if err != nil {
+		t.Fatalf("CI step returned error: %v", err)
+	}
+	if outcome == nil || !outcome.NeedsApproval || outcome.AutoFixable {
+		t.Fatalf("outcome = %#v, want a non-auto-fixable owner-action gate", outcome)
+	}
+	if got := f.localHead(t); got != f.headSHA {
+		t.Fatalf("local head = %s, want original head %s", got, f.headSHA)
+	}
+	if got := f.remoteHead(t); got != f.headSHA {
+		t.Fatalf("remote head = %s, want original head %s", got, f.headSHA)
+	}
+	if status := gitCmd(t, f.dir, "status", "--porcelain"); status != "" {
+		t.Fatalf("worktree status = %q, want clean after discarding no-code repair output", status)
+	}
+	if _, err := os.Stat(filepath.Join(f.dir, ".ci-failed.log")); !os.IsNotExist(err) {
+		t.Fatalf("raw CI failure log still exists, stat error = %v", err)
+	}
+	findings, err := types.ParseFindingsJSON(outcome.Findings)
+	if err != nil {
+		t.Fatalf("parse parked findings: %v", err)
+	}
+	if len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAskUser {
+		t.Fatalf("parked findings = %+v, want the failing check retained as ask-user", findings.Items)
+	}
+}
+
 // run drives the monitor until it returns or the poll budget is spent.
 func (f *ciRepairFixture) run(t *testing.T) (*pipeline.StepOutcome, error) {
 	t.Helper()

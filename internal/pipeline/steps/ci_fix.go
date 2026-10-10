@@ -279,6 +279,15 @@ CI logs:
 	if conclusionErr != nil {
 		sctx.Log(fmt.Sprintf("warning: could not parse CI repair conclusion: %v", conclusionErr))
 	}
+	if !mergeConflict && conclusionErr == nil && conclusion.CodeChangeNeeded != nil && !*conclusion.CodeChangeNeeded {
+		if err := discardCIRepairChanges(sctx); err != nil {
+			return ciRepairResult{}, fmt.Errorf("discard CI no-change repair: %w", err)
+		}
+		return ciRepairResult{
+			NoCodeChangeNeeded: true,
+			Summary:            conclusion.Summary,
+		}, nil
+	}
 	repair, err := s.commitRepair(sctx, conclusion.Summary, result)
 	var refusal *pipeline.ProtectedPathError
 	if errors.As(err, &refusal) {
@@ -294,10 +303,6 @@ CI logs:
 	if repair.HeadAdvanced {
 		repair.Summary = conclusion.Summary
 		return repair, nil
-	}
-	if !mergeConflict && conclusion.CodeChangeNeeded != nil && !*conclusion.CodeChangeNeeded {
-		repair.NoCodeChangeNeeded = true
-		repair.Summary = conclusion.Summary
 	}
 	return repair, nil
 }
@@ -647,6 +652,25 @@ func (s *CIStep) commitRepair(sctx *pipeline.StepContext, summary string, produc
 	}
 
 	return s.recordRepair(sctx, headSHA)
+}
+
+// discardCIRepairChanges returns the run worktree to its recorded head after
+// the fixer has concluded that the failing check is not caused by the code.
+// The fixer may have written scratch output or even committed that output
+// before returning its structured conclusion; neither belongs in the PR or in
+// a later owner-directed repair round.
+func discardCIRepairChanges(sctx *pipeline.StepContext) error {
+	head := strings.TrimSpace(sctx.Run.HeadSHA)
+	if head == "" {
+		return errors.New("run has no recorded head")
+	}
+	if _, err := stepGitRun(sctx, "reset", "--hard", head); err != nil {
+		return fmt.Errorf("reset to recorded head: %w", err)
+	}
+	if _, err := stepGitRun(sctx, "clean", "-ffd"); err != nil {
+		return fmt.Errorf("remove CI fixer scratch files: %w", err)
+	}
+	return nil
 }
 
 // ciHeadAwaitsRecording reports whether a fix round that committed nothing

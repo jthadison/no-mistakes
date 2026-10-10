@@ -18,6 +18,9 @@ func TestCustodyReturnedSymbolicGateLaneIsNotReadyForPipeline(t *testing.T) {
 	if inspected.NextAction != nil && inspected.NextAction.Code == "adopt_reconciled_local" {
 		t.Fatalf("symbolic gate lane was offered reconciled-local adoption: %#v", inspected)
 	}
+	if inspected.NextAction != nil && inspected.NextAction.Code == "run_pipeline" {
+		t.Fatalf("symbolic gate lane exposed a fresh pipeline run: %#v", inspected)
+	}
 
 	state := f.service.AdoptReconciledLocal(f.ctx)
 	if state.Changed || state.Safety == "adopted_reconciled_local" || state.Safety == "already_adopted_reconciled_local" {

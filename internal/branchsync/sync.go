@@ -1572,7 +1572,7 @@ func (s *Service) AdoptReconciledLocal(ctx context.Context) State {
 	if !state.Local.Clean {
 		return blockedPlan(state, StateDirty, "blocked_adopt_reconciled_local_dirty", "the invoking worktree is not completely clean; no files or gate refs were changed")
 	}
-	gateHead, _, proofErr := s.reconciledLocalProof(ctx, state, run)
+	gateHead, proofErr := s.reconciledLocalProof(ctx, state, run)
 	if proofErr != "" {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_"+proofErr, "the local head does not satisfy the lossless reconciled-local proof; no files or gate refs were changed")
 	}
@@ -1616,7 +1616,7 @@ func (s *Service) AdoptReconciledLocal(ctx context.Context) State {
 	if !samePath(freshRepo.WorkingPath, s.Repo.WorkingPath) {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_repository_changed", "the registered repository changed before reconciled-local adoption; no files or gate refs were changed")
 	}
-	gateHead, _, proofErr = s.reconciledLocalProof(ctx, state, freshRun)
+	gateHead, proofErr = s.reconciledLocalProof(ctx, state, freshRun)
 	if proofErr != "" {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_reconciled_local_"+proofErr, "the local head no longer satisfies the lossless reconciled-local proof; no files or gate refs were changed")
 	}
@@ -1698,53 +1698,53 @@ func (s *Service) AdoptReconciledLocal(ctx context.Context) State {
 	return final
 }
 
-// reconciledLocalProof returns the old gate head and all protected commits
-// that must remain reachable from the local reconciled head. It is read-only.
-func (s *Service) reconciledLocalProof(ctx context.Context, state State, run *db.Run) (string, []string, string) {
+// reconciledLocalProof returns the old gate head after verifying all protected
+// commits remain reachable from the local reconciled head. It is read-only.
+func (s *Service) reconciledLocalProof(ctx context.Context, state State, run *db.Run) (string, string) {
 	if run == nil || run.RepoID != s.Repo.ID || run.Branch != state.Local.Branch ||
 		run.Status != types.RunFailed || run.CustodyReturnedAt == nil ||
 		run.SubmittedHeadSHA == nil || strings.TrimSpace(*run.SubmittedHeadSHA) == "" ||
 		run.LastPushedSHA != nil || run.HeadSHA == "" ||
 		run.TerminalHeadVerifiedAt == nil {
-		return "", nil, "not_applicable"
+		return "", "not_applicable"
 	}
 	branchRef := "refs/heads/" + state.Local.Branch
 	gateHead, exists, err := git.DirectRefTarget(ctx, s.GateDir, branchRef)
 	if err != nil || !exists {
-		return "", nil, "gate_changed"
+		return "", "gate_changed"
 	}
 	oldGate := gateHead
 	if gateHead != *run.SubmittedHeadSHA {
 		if gateHead != state.Local.Head {
-			return "", nil, "gate_changed"
+			return "", "gate_changed"
 		}
 		oldGate, exists, err = git.DirectRefTarget(ctx, s.GateDir, custody.RecoveryGateRef(run.ID))
 		if err != nil || !exists || oldGate != *run.SubmittedHeadSHA {
-			return "", nil, "gate_changed"
+			return "", "gate_changed"
 		}
 	}
 	if !objectExists(ctx, s.workDir(), run.HeadSHA) || !objectExists(ctx, s.workDir(), oldGate) ||
 		!objectExists(ctx, s.workDir(), state.Local.Head) {
-		return "", nil, "missing_object"
+		return "", "missing_object"
 	}
 	preservedTree, preservedErr := git.Run(ctx, s.workDir(), "rev-parse", run.HeadSHA+"^{tree}")
 	localTree, localErr := git.Run(ctx, s.workDir(), "rev-parse", state.Local.Head+"^{tree}")
 	if preservedErr != nil || localErr != nil || preservedTree != localTree {
-		return "", nil, "tree_mismatch"
+		return "", "tree_mismatch"
 	}
 	if !isAncestor(ctx, s.workDir(), oldGate, state.Local.Head) {
-		return "", nil, "old_gate_not_ancestor"
+		return "", "old_gate_not_ancestor"
 	}
 	protected, err := revList(ctx, s.workDir(), "rev-list", oldGate+".."+run.HeadSHA)
 	if err != nil || len(protected) == 0 {
-		return "", nil, "protected_commits_unreadable"
+		return "", "protected_commits_unreadable"
 	}
 	for _, commit := range protected {
 		if !isAncestor(ctx, s.workDir(), commit, state.Local.Head) {
-			return "", nil, "protected_commit_missing"
+			return "", "protected_commit_missing"
 		}
 	}
-	return oldGate, protected, ""
+	return oldGate, ""
 }
 
 // AdoptPublished moves one stale custody-returned gate lane to a rewritten
@@ -2767,15 +2767,16 @@ func (s *Service) classifyCustodyReturned(ctx context.Context, state *State, run
 			state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
 			return
 		}
-		if _, _, proofErr := s.reconciledLocalProof(ctx, *state, run); proofErr == "" {
+		if _, proofErr := s.reconciledLocalProof(ctx, *state, run); proofErr == "" {
 			state.Safety = "reconciled_local_recoverable"
 			state.NextAction = &NextAction{Code: "adopt_reconciled_local", Command: "no-mistakes axi sync --adopt-reconciled-local"}
 			return
 		}
 	}
 	if state.Relation == RelationAhead {
-		state.Safety = "custody_returned"
-		state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
+		state.Safety = "blocked_recover_manual_reconciliation"
+		state.Error = "the selected gate lane is not a verified direct ref for the reconciled local head; inspect and reconcile the gate manually"
+		state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
 		return
 	}
 	state.Safety = "recovery_required"
