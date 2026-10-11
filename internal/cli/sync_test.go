@@ -24,6 +24,24 @@ type cliSyncFixture struct {
 	local, remote, base, old, pushed, runID string
 }
 
+func TestAxiSyncAdoptionSuccessIsModeSpecific(t *testing.T) {
+	idempotentReconciled := branchsync.State{Safety: "already_adopted_reconciled_local"}
+	if axiSyncSuccessful(idempotentReconciled, false, false, true, false, "") {
+		t.Fatalf("--adopt-published accepted reconciled-local idempotence")
+	}
+	if !axiSyncSuccessful(idempotentReconciled, false, false, false, true, "") {
+		t.Fatalf("--adopt-reconciled-local rejected its idempotent no-op")
+	}
+
+	changed := branchsync.State{Changed: true}
+	if !axiSyncSuccessful(changed, false, false, true, false, "") {
+		t.Fatalf("--adopt-published rejected changed adoption")
+	}
+	if !axiSyncSuccessful(changed, false, false, false, true, "") {
+		t.Fatalf("--adopt-reconciled-local rejected changed adoption")
+	}
+}
+
 func newCLISyncFixture(t *testing.T) cliSyncFixture {
 	t.Helper()
 	nmHome := filepath.Join(t.TempDir(), "nm-home")
@@ -1563,6 +1581,9 @@ func TestSyncRecoverFlagValidation(t *testing.T) {
 		{"axi", "sync", "--check", "--recover"},
 		{"axi", "sync", "--check", "--adopt-published"},
 		{"axi", "sync", "--recover", "--adopt-published"},
+		{"axi", "sync", "--check", "--adopt-reconciled-local"},
+		{"axi", "sync", "--recover", "--adopt-reconciled-local"},
+		{"axi", "sync", "--adopt-published", "--adopt-reconciled-local"},
 		{"axi", "sync", "--keep-local"},
 		{"axi", "sync", "--bind-archive-ref", "refs/heads/archive/test", "--check"},
 	} {
