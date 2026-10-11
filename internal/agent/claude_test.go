@@ -458,6 +458,48 @@ func TestParseClaudeEvents_ErrorResult(t *testing.T) {
 	}
 }
 
+func TestClaudeProviderAccessReason_RecognizesOnlyProviderAccessFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{"authentication", `{"error":{"type":"authentication_error","message":"invalid x-api-key"}}`, "authentication failure"},
+		{"quota", `{"error":{"type":"insufficient_quota","message":"quota exceeded"}}`, "insufficient quota"},
+		{"organization disabled", `{"error":{"message":"organization has been disabled"}}`, "organization disabled"},
+		{"ordinary provider error", `{"error":{"type":"invalid_request_error","message":"bad schema"}}`, ""},
+		{"structured output text mentioning quota", `{"text":"quota is not part of the requested schema"}`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := claudeProviderAccessReason([]byte(tt.text)); got != tt.want {
+				t.Fatalf("claudeProviderAccessReason() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseClaudeEventsWithEvidence_RejectsFallbackAfterAssistantEvent(t *testing.T) {
+	events := strings.Join([]string{
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write"}]}}`,
+		`{"type":"result","subtype":"error","is_error":true,"error":"authentication_error"}`,
+	}, "\n")
+	var usage TokenUsage
+	var result *claudeResult
+	var evidence claudeEventEvidence
+	if err := parseClaudeEventsWithEvidence(context.Background(), strings.NewReader(events), nil, &usage, &result, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if !evidence.assistantSeen {
+		t.Fatal("assistant event did not establish side-effect risk")
+	}
+	if got := claudeProviderAccessReason(result.rawEvent); got == "" {
+		t.Fatal("expected provider access marker in result event")
+	}
+	if isPreflightProviderAccessError(&providerAccessError{cause: errors.New("authentication_error"), preSideEffect: evidence.preSideEffect()}) {
+		t.Fatal("assistant activity must not be classified as preflight-safe")
+	}
+}
 func TestClaudeAgent_FinalizeResult_NoSchemaAllowsTextOnly(t *testing.T) {
 	result, err := finalizeClaudeResult(&claudeResult{
 		Subtype: "success",
