@@ -520,16 +520,7 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished, a
 		fields = append(fields, toON.Field{Key: "help", Value: help})
 	}
 	emitDoc(cmd, fields...)
-	successful := syncStateSuccessful(state, check)
-	if recover {
-		successful = state.Recovered
-	}
-	if bindArchiveRef != "" {
-		successful = verifiedArchiveRecovery(state)
-	}
-	if adoptPublished || adoptReconciledLocal {
-		successful = state.Changed || state.Safety == "already_adopted_reconciled_local"
-	}
+	successful := axiSyncSuccessful(state, check, recover, adoptPublished, adoptReconciledLocal, bindArchiveRef)
 	if successful {
 		if state.Changed {
 			result = "applied"
@@ -540,6 +531,23 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished, a
 	}
 	result = "refused"
 	return &exitError{code: 1}
+}
+
+func axiSyncSuccessful(state branchsync.State, check, recover, adoptPublished, adoptReconciledLocal bool, bindArchiveRef string) bool {
+	successful := syncStateSuccessful(state, check)
+	if recover {
+		return state.Recovered
+	}
+	if bindArchiveRef != "" {
+		return verifiedArchiveRecovery(state)
+	}
+	if adoptPublished {
+		return state.Changed
+	}
+	if adoptReconciledLocal {
+		return state.Changed || state.Safety == "already_adopted_reconciled_local"
+	}
+	return successful
 }
 
 func verifiedArchiveRecovery(state branchsync.State) bool {
