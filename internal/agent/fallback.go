@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,7 +13,8 @@ type fallbackAgent struct {
 }
 
 // NewFallback returns an Agent that tries each agent in order when an
-// invocation fails because the current agent process is unavailable.
+// invocation fails because the current agent process is unavailable or its
+// provider rejects access before starting the requested run.
 func NewFallback(agents []Agent) Agent {
 	switch len(agents) {
 	case 0:
@@ -115,7 +117,7 @@ func (a *fallbackAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) 
 		if context.Cause(ctx) != nil {
 			return nil, err
 		}
-		if i == len(candidates)-1 || !isAgentUnavailableError(err) {
+		if i == len(candidates)-1 || (!isAgentUnavailableError(err) && !isPreflightProviderAccessError(err)) {
 			return nil, err
 		}
 		next := candidates[i+1]
@@ -155,6 +157,34 @@ func isAgentUnavailableError(err error) bool {
 		}
 	}
 	return false
+}
+
+// providerAccessError is emitted only by an adapter that has evidence that a
+// provider rejected the request before it could begin the run. The
+// preSideEffect bit is deliberately part of the error so a provider failure
+// cannot opt into replay merely by using an access-looking message.
+type providerAccessError struct {
+	cause         error
+	preSideEffect bool
+}
+
+func (e *providerAccessError) Error() string {
+	if e == nil || e.cause == nil {
+		return "provider access unavailable"
+	}
+	return e.cause.Error()
+}
+
+func (e *providerAccessError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func isPreflightProviderAccessError(err error) bool {
+	var accessErr *providerAccessError
+	return errors.As(err, &accessErr) && accessErr != nil && accessErr.preSideEffect
 }
 
 func fallbackReason(err error) string {

@@ -113,6 +113,89 @@ func TestFallbackAgentDoesNotFallBackOnStructuredOutputError(t *testing.T) {
 	}
 }
 
+func TestFallbackAgentFallsBackOnPreflightProviderAccessFailure(t *testing.T) {
+	for _, message := range []string{
+		`claude error: authentication_error: invalid x-api-key`,
+		`claude error: insufficient_quota`,
+		`claude error: organization has been disabled`,
+	} {
+		t.Run(message, func(t *testing.T) {
+			first := &fallbackTestAgent{
+				name: "claude",
+				run: func() (*Result, error) {
+					return nil, claudeProviderAccessError(errors.New(message), "provider access denied")
+				},
+			}
+			second := &fallbackTestAgent{
+				name: "acp:omp",
+				run: func() (*Result, error) {
+					return &Result{Text: "ok"}, nil
+				},
+			}
+
+			result, err := NewFallback([]Agent{first, second}).Run(context.Background(), RunOpts{})
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if result == nil || result.Text != "ok" {
+				t.Fatalf("Run() result = %+v, want omp result", result)
+			}
+			if first.calls != 1 || second.calls != 1 {
+				t.Fatalf("calls = first %d second %d, want 1/1", first.calls, second.calls)
+			}
+		})
+	}
+}
+
+func TestFallbackAgentDoesNotFallBackOnProviderFailureAfterSideEffects(t *testing.T) {
+	first := &fallbackTestAgent{
+		name: "claude",
+		run: func() (*Result, error) {
+			return nil, &providerAccessError{
+				cause:         errors.New("claude error: authentication_error"),
+				preSideEffect: false,
+			}
+		},
+	}
+	second := &fallbackTestAgent{
+		name: "acp:omp",
+		run: func() (*Result, error) {
+			return &Result{Text: "must not run"}, nil
+		},
+	}
+
+	_, err := NewFallback([]Agent{first, second}).Run(context.Background(), RunOpts{})
+	if err == nil || !strings.Contains(err.Error(), "authentication_error") {
+		t.Fatalf("Run() error = %v, want provider error", err)
+	}
+	if first.calls != 1 || second.calls != 0 {
+		t.Fatalf("calls = first %d second %d, want 1/0", first.calls, second.calls)
+	}
+}
+
+func TestFallbackAgentDoesNotFallBackOnUnclassifiedProviderFailure(t *testing.T) {
+	first := &fallbackTestAgent{
+		name: "claude",
+		run: func() (*Result, error) {
+			return nil, errors.New("claude provider rejected the request after starting the turn")
+		},
+	}
+	second := &fallbackTestAgent{
+		name: "acp:omp",
+		run: func() (*Result, error) {
+			return &Result{Text: "must not run"}, nil
+		},
+	}
+
+	_, err := NewFallback([]Agent{first, second}).Run(context.Background(), RunOpts{})
+	if err == nil {
+		t.Fatal("Run() error = nil, want provider error")
+	}
+	if first.calls != 1 || second.calls != 0 {
+		t.Fatalf("calls = first %d second %d, want 1/0", first.calls, second.calls)
+	}
+}
+
 func TestFallbackAgent_ForwardsSessionCapability(t *testing.T) {
 	first := &fallbackTestAgent{name: "codex", resumable: true, run: func() (*Result, error) { return &Result{}, nil }}
 	second := &fallbackTestAgent{name: "claude", resumable: true, run: func() (*Result, error) { return &Result{}, nil }}

@@ -24,6 +24,62 @@ var errNoStructuredOutput = errors.New("claude returned no structured output")
 
 const claudeScannerMaxTokenSize = 256 * 1024 * 1024
 
+// claudeProviderAccessNeedles are provider-owned failures that prove Claude
+// rejected the request before starting a model turn. Transport failures,
+// generic provider errors, and rate limits stay outside this list.
+var claudeProviderAccessNeedles = []struct {
+	needle string
+	label  string
+}{
+	{"authentication_error", "authentication failure"},
+	{"invalid x-api-key", "invalid API key"},
+	{"invalid api key", "invalid API key"},
+	{"not authenticated", "authentication failure"},
+	{"authentication failed", "authentication failure"},
+	{"permission_error", "provider permission denied"},
+	{"access denied", "provider access denied"},
+	{"insufficient_quota", "insufficient quota"},
+	{"insufficient quota", "insufficient quota"},
+	{"quota_exhausted", "quota exhausted"},
+	{"quota exhausted", "quota exhausted"},
+	{"quota_exceeded", "quota exceeded"},
+	{"quota exceeded", "quota exceeded"},
+	{"exceeded your current quota", "quota exceeded"},
+	{"freeusagelimit", "free usage limit"},
+	{"free usage limit", "free usage limit"},
+	{"organization_disabled", "organization disabled"},
+	{"organization-disabled", "organization disabled"},
+	{"organization disabled", "organization disabled"},
+	{"organization has been disabled", "organization disabled"},
+	{"organization is disabled", "organization disabled"},
+}
+
+type claudeEventEvidence struct {
+	assistantSeen bool
+	unsafeEvent   bool
+}
+
+func (e claudeEventEvidence) preSideEffect() bool {
+	return !e.assistantSeen && !e.unsafeEvent
+}
+
+func claudeProviderAccessReason(text []byte) string {
+	msg := strings.ToLower(string(text))
+	for _, sig := range claudeProviderAccessNeedles {
+		if strings.Contains(msg, sig.needle) {
+			return sig.label
+		}
+	}
+	return ""
+}
+
+func claudeProviderAccessError(cause error, reason string) error {
+	return &providerAccessError{
+		cause:         fmt.Errorf("claude provider access unavailable (%s): %w", reason, cause),
+		preSideEffect: true,
+	}
+}
+
 // claudeAgent spawns the claude CLI for each invocation.
 type claudeAgent struct {
 	bin       string
@@ -99,7 +155,8 @@ func (a *claudeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 
 	var usage TokenUsage
 	var result *claudeResult
-	if err := parseClaudeEvents(ctx, started.stdout, opts.OnChunk, &usage, &result); err != nil {
+	var evidence claudeEventEvidence
+	if err := parseClaudeEventsWithEvidence(ctx, started.stdout, opts.OnChunk, &usage, &result, &evidence); err != nil {
 		err = started.waitAfterParseError(err)
 		stderrWG.Wait()
 		retErr := fmt.Errorf("claude parse events: %w", err)
@@ -111,6 +168,11 @@ func (a *claudeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 	stderrWG.Wait()
 	if waitErr != nil {
 		retErr := fmt.Errorf("claude exited: %w: %s", waitErr, string(stderrBuf))
+		if evidence.preSideEffect() {
+			if reason := claudeProviderAccessReason(stderrBuf); reason != "" {
+				retErr = claudeProviderAccessError(retErr, reason)
+			}
+		}
 		emitAgentExited(opts, "claude", pid, retErr)
 		return resultFromUsage(usage), retErr
 	}
@@ -122,6 +184,11 @@ func (a *claudeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 	}
 
 	res, err := finalizeClaudeResult(result, opts.JSONSchema, usage)
+	if err != nil && (result.IsError || result.Subtype != "success") && evidence.preSideEffect() {
+		if reason := claudeProviderAccessReason(result.rawEvent); reason != "" {
+			err = claudeProviderAccessError(err, reason)
+		}
+	}
 	if res != nil {
 		res.SessionID = result.sessionID
 		res.Resumed = resumeID != ""
@@ -318,6 +385,10 @@ type claudeContent struct {
 // parseClaudeEvents reads JSONL from the reader and dispatches events.
 // It accumulates token usage and captures the final result event.
 func parseClaudeEvents(ctx context.Context, r io.Reader, onChunk func(string), usage *TokenUsage, result **claudeResult) error {
+	return parseClaudeEventsWithEvidence(ctx, r, onChunk, usage, result, nil)
+}
+
+func parseClaudeEventsWithEvidence(ctx context.Context, r io.Reader, onChunk func(string), usage *TokenUsage, result **claudeResult, evidence *claudeEventEvidence) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), claudeScannerMaxTokenSize)
 	var textBuf string
@@ -339,7 +410,13 @@ func parseClaudeEvents(ctx context.Context, r io.Reader, onChunk func(string), u
 
 		var event claudeEvent
 		if err := json.Unmarshal(line, &event); err != nil {
+			if evidence != nil {
+				evidence.unsafeEvent = true
+			}
 			continue // skip malformed lines
+		}
+		if event.Type != "assistant" && event.Type != "result" && event.Type != "system" && evidence != nil {
+			evidence.unsafeEvent = true
 		}
 		if event.SessionID != "" {
 			lastSessionID = event.SessionID
@@ -347,6 +424,9 @@ func parseClaudeEvents(ctx context.Context, r io.Reader, onChunk func(string), u
 
 		switch event.Type {
 		case "assistant":
+			if evidence != nil {
+				evidence.assistantSeen = true
+			}
 			var msg claudeMessage
 			if err := json.Unmarshal(event.Message, &msg); err != nil {
 				continue
